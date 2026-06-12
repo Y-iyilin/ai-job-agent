@@ -9,11 +9,21 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from company_risk import assess_company_risk
+from fixed_template_engine import (
+    FixedTemplateError,
+    build_replacement_prompt,
+    extract_template_blocks,
+    load_template_bytes,
+    merge_editable_replacements,
+    normalize_replacements,
+    render_fixed_template,
+    to_editable_replacements,
+)
 from hot_skills import recommend_hot_skills
 from job_crawler import crawl_jobs
 from job_links import build_job_links, build_search_keywords
 from llm_client import LLMConfigError, call_job_agent
-from prompts import build_resume_rewrite_prompt, build_template_resume_prompt, build_user_prompt
+from prompts import build_resume_rewrite_prompt, build_role_questionnaire_prompt, build_template_resume_prompt, build_user_prompt
 from resume_exporter import (
     build_docx,
     build_docx_from_template,
@@ -28,7 +38,7 @@ from resume_exporter import (
     preview_pdf_template,
 )
 from resume_parser import ResumeParseError, parse_resume_file
-from role_recommender import ROLE_POOL, recommend_roles
+from role_recommender import ROLE_POOL
 
 
 st.set_page_config(
@@ -156,11 +166,18 @@ st.markdown(
         overflow-x: auto;
     }
     .workflow-card {
+        position: fixed;
+        top: 12px;
+        left: calc(21rem + max(1rem, (100vw - 21rem - 1100px) / 2));
+        width: min(1100px, calc(100vw - 21rem - 2rem));
+        z-index: 999;
         border: 1px solid #E5E7EB;
         border-radius: 8px;
         background: #FFFFFF;
         padding: 15px 16px 14px 16px;
-        margin: 0 0 14px 0;
+        margin: 0 0 18px 0;
+        box-shadow: 0 10px 24px rgba(15, 23, 42, .08);
+        backdrop-filter: blur(10px);
     }
     .workflow-title {
         font-size: 11px;
@@ -170,17 +187,30 @@ st.markdown(
         letter-spacing: .08em;
         margin-bottom: 12px;
     }
+    .workflow-spacer {
+        height: 126px;
+    }
+    .workflow-progress {
+        position: relative;
+        height: 6px;
+        border-radius: 999px;
+        background: #F3F4F6;
+        overflow: hidden;
+        margin: 2px 0 14px 0;
+    }
+    .workflow-progress-fill {
+        height: 100%;
+        border-radius: 999px;
+        background: #DC2626;
+        transition: width .35s ease;
+    }
     .workflow-item {
         flex: 1 1 0;
         min-width: 120px;
         display: flex;
         flex-direction: column;
         align-items: stretch;
-    }
-    .workflow-line {
-        display: flex;
-        align-items: center;
-        gap: 8px;
+        gap: 7px;
     }
     .workflow-dot {
         width: 24px;
@@ -203,16 +233,7 @@ st.markdown(
         background: #22C55E;
         color: #FFFFFF;
     }
-    .workflow-connector {
-        height: 1px;
-        background: #E5E7EB;
-        flex: 1;
-    }
-    .workflow-item.done .workflow-connector {
-        background: #86EFAC;
-    }
     .workflow-label {
-        margin-top: 7px;
         padding-right: 10px;
         font-size: 11px;
         line-height: 1.35;
@@ -378,6 +399,14 @@ st.markdown(
         to { transform: rotate(360deg); }
     }
     @media (max-width: 900px) {
+        .workflow-card {
+            left: 1rem;
+            width: calc(100vw - 2rem);
+            top: 8px;
+        }
+        .workflow-spacer {
+            height: 150px;
+        }
         .workflow-strip {
             grid-template-columns: repeat(2, minmax(0, 1fr));
         }
@@ -458,6 +487,14 @@ def save_history_file(file_name: str, data: bytes) -> str:
     return str(path)
 
 
+def save_output_file(file_name: str, data: bytes) -> str:
+    output_dir = Path("output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / file_name
+    path.write_bytes(data)
+    return str(path)
+
+
 def render_pdf_preview(pdf_bytes: bytes) -> None:
     encoded = base64.b64encode(pdf_bytes).decode("ascii")
     st.markdown(
@@ -496,6 +533,64 @@ def render_metric_card(label: str, value: str, hint: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def build_workflow_html(current_step: int) -> str:
+    steps = [
+        "读取简历和目标",
+        "生成关键词标签",
+        "爬取真实岗位",
+        "分析 JD 匹配",
+        "生成改写内容",
+        "导出下载文件",
+    ]
+    current_step = max(1, min(int(current_step or 1), len(steps)))
+    progress_width = int(((current_step - 1) / (len(steps) - 1)) * 100)
+    items = []
+    for index, label in enumerate(steps, start=1):
+        if index < current_step:
+            state = "done"
+            dot = "✓"
+        elif index == current_step:
+            state = "active"
+            dot = f"{index:02d}"
+        else:
+            state = ""
+            dot = f"{index:02d}"
+        items.append(
+            f'<div class="workflow-item {state}">'
+            f'<div class="workflow-dot {state}">{dot}</div>'
+            f'<div class="workflow-label">{label}</div>'
+            f'</div>'
+        )
+    return (
+        '<div class="workflow-card">'
+        '<div class="workflow-title">Agent 工作流</div>'
+        f'<div class="workflow-progress"><div class="workflow-progress-fill" style="width:{progress_width}%;"></div></div>'
+        f'<div class="workflow-strip">{"".join(items)}</div>'
+        '</div>'
+    )
+
+
+def render_workflow(current_step: int) -> None:
+    st.markdown(build_workflow_html(current_step), unsafe_allow_html=True)
+    st.markdown('<div class="workflow-spacer"></div>', unsafe_allow_html=True)
+
+
+def get_agent_step() -> int:
+    manual_step = int(st.session_state.get("agent_workflow_step", 1) or 1)
+    inferred_step = 1
+    if st.session_state.resume_docx_data or st.session_state.resume_pdf_data:
+        inferred_step = 6
+    elif st.session_state.resume_rewrite_result or st.session_state.word_resume_text or st.session_state.pdf_resume_text:
+        inferred_step = 5
+    elif st.session_state.analysis_result:
+        inferred_step = 4
+    elif st.session_state.crawled_jobs:
+        inferred_step = 3
+    elif st.session_state.search_keywords or st.session_state.hot_skills:
+        inferred_step = 2
+    return max(manual_step, inferred_step)
 
 
 def render_env_status() -> None:
@@ -572,6 +667,20 @@ def render_company_risk_result(result: dict[str, object]) -> None:
                 st.write(f"- {item}")
         else:
             st.write("- 暂未检索到足够明确的正向资质信号。")
+    dimensions = result.get("dimensions", [])
+    breakdown = result.get("breakdown", {})
+    if isinstance(breakdown, dict) and breakdown:
+        st.markdown("**分项评分**")
+        score_cols = st.columns(min(5, len(breakdown)))
+        for index, (name, value) in enumerate(breakdown.items()):
+            with score_cols[index % len(score_cols)]:
+                st.metric(str(name), f"{int(value)}")
+    if dimensions:
+        st.markdown("**评分维度**")
+        dim_cols = st.columns(2)
+        for index, item in enumerate(dimensions):
+            with dim_cols[index % 2]:
+                st.caption(f"- {item}")
 
     with st.expander("查看公开信息摘要和核验入口", expanded=False):
         st.caption("评分基于公开搜索摘要和岗位描述关键词，只用于求职风险提醒，不等同于法律或工商结论。")
@@ -615,6 +724,10 @@ def init_state() -> None:
         st.session_state.uploaded_resume_name = ""
     if "role_recommendations" not in st.session_state:
         st.session_state.role_recommendations = []
+    if "role_questionnaire_result" not in st.session_state:
+        st.session_state.role_questionnaire_result = ""
+    if "custom_target_role" not in st.session_state:
+        st.session_state.custom_target_role = ""
     if "imported_template_bytes" not in st.session_state:
         st.session_state.imported_template_bytes = b""
     if "imported_template_name" not in st.session_state:
@@ -637,6 +750,20 @@ def init_state() -> None:
         st.session_state.usage_history = load_usage_history()
     if "company_risk_results" not in st.session_state:
         st.session_state.company_risk_results = {}
+    if "agent_workflow_step" not in st.session_state:
+        st.session_state.agent_workflow_step = 1
+    if "fixed_resume_text" not in st.session_state:
+        st.session_state.fixed_resume_text = ""
+    if "fixed_template_bytes" not in st.session_state:
+        st.session_state.fixed_template_bytes = b""
+    if "fixed_template_name" not in st.session_state:
+        st.session_state.fixed_template_name = ""
+    if "fixed_template_signature" not in st.session_state:
+        st.session_state.fixed_template_signature = ""
+    if "fixed_replacements_text" not in st.session_state:
+        st.session_state.fixed_replacements_text = ""
+    if "fixed_result_docx" not in st.session_state:
+        st.session_state.fixed_result_docx = b""
     if "user_ai_provider" not in st.session_state:
         st.session_state.user_ai_provider = "中转站"
     if "user_ai_base_url" not in st.session_state:
@@ -654,6 +781,16 @@ def clear_resume_exports() -> None:
     st.session_state.resume_pdf_data = b""
     st.session_state.template_docx_data = b""
     st.session_state.template_pdf_data = b""
+
+
+def set_agent_step(step: int) -> None:
+    st.session_state.agent_workflow_step = max(1, min(int(step), 6))
+
+
+def file_signature(file_obj) -> str:
+    if file_obj is None:
+        return ""
+    return f"{getattr(file_obj, 'name', '')}:{getattr(file_obj, 'size', 0)}"
 
 
 def build_markdown_file(
@@ -715,6 +852,9 @@ def build_markdown_file(
 def main() -> None:
     init_state()
 
+    workflow_placeholder = st.empty()
+    workflow_placeholder.markdown(build_workflow_html(get_agent_step()), unsafe_allow_html=True)
+    st.markdown('<div class="workflow-spacer"></div>', unsafe_allow_html=True)
     st.markdown(
         """
         <div class="figma-notice">
@@ -732,30 +872,9 @@ def main() -> None:
             <span class="hero-badge">历史记录</span>
           </div>
         </div>
-        <div class="workflow-card">
-          <div class="workflow-title">Agent 工作流</div>
-          <div class="workflow-strip">
-            <div class="workflow-item active"><div class="workflow-line"><div class="workflow-dot active">01</div><div class="workflow-connector"></div></div><div class="workflow-label">读取简历与目标岗位</div></div>
-            <div class="workflow-item"><div class="workflow-line"><div class="workflow-dot">02</div><div class="workflow-connector"></div></div><div class="workflow-label">生成关键词和能力标签</div></div>
-            <div class="workflow-item"><div class="workflow-line"><div class="workflow-dot">03</div><div class="workflow-connector"></div></div><div class="workflow-label">爬取公开招聘岗位</div></div>
-            <div class="workflow-item"><div class="workflow-line"><div class="workflow-dot">04</div><div class="workflow-connector"></div></div><div class="workflow-label">调用模型分析 JD 匹配</div></div>
-            <div class="workflow-item"><div class="workflow-line"><div class="workflow-dot">05</div><div class="workflow-connector"></div></div><div class="workflow-label">人工确认并编辑简历</div></div>
-            <div class="workflow-item"><div class="workflow-line"><div class="workflow-dot">06</div></div><div class="workflow-label">导出 Word / PDF 文件</div></div>
-          </div>
-        </div>
         """,
         unsafe_allow_html=True,
     )
-
-    summary_cols = st.columns(4)
-    with summary_cols[0]:
-        render_metric_card("当前岗位方向", "待选择", "支持 25+ 大众求职方向")
-    with summary_cols[1]:
-        render_metric_card("岗位侦察", str(len(st.session_state.crawled_jobs)), "抓取真实岗位详情页")
-    with summary_cols[2]:
-        render_metric_card("历史记录", str(len(st.session_state.usage_history)), "可载入旧结果继续编辑")
-    with summary_cols[3]:
-        render_metric_card("导出能力", "Word / PDF", "支持模板参考与在线编辑")
 
     with st.sidebar:
         st.markdown(
@@ -916,42 +1035,54 @@ def main() -> None:
             submitted = st.form_submit_button("生成岗位方向推荐", use_container_width=True)
 
         if submitted:
-            st.session_state.role_recommendations = recommend_roles(
-                {
-                    "major": major,
-                    "education": education,
-                    "internship": internship,
-                    "work_preference": work_preference,
-                    "coding_level": coding_level,
-                    "sql": sql,
-                    "excel": excel,
-                    "english": english,
-                    "communication": communication,
-                    "document": document,
-                    "business_trip": business_trip,
-                    "pressure": pressure,
-                    "detail": detail,
-                    "creativity": creativity,
-                    "customer": customer,
-                    "team_style": team_style,
-                    "learning_speed": learning_speed,
-                    "company_type": company_type,
-                    "industry": industry,
-                    "salary_priority": salary_priority,
-                    "city_preference": city_preference,
-                    "sales_acceptance": sales_acceptance,
-                    "operations_interest": operations_interest,
-                    "dev_interest": dev_interest,
-                    "long_term_goal": long_term_goal,
-                    "certificates": certificates,
-                    "ai_tools": ai_tools,
-                }
-            )
+            questionnaire_answers = {
+                "专业/背景": major,
+                "学历阶段": education,
+                "实习情况": internship,
+                "更愿意做的工作": work_preference,
+                "代码能力": coding_level,
+                "SQL / 数据库能力": sql,
+                "Excel / 表格能力": excel,
+                "英语或文档阅读能力": english,
+                "AI 工具使用意愿": ai_tools,
+                "沟通接受度": communication,
+                "文档整理接受度": document,
+                "出差/现场支持接受度": business_trip,
+                "压力偏好": pressure,
+                "细心程度": detail,
+                "创意表达偏好": creativity,
+                "面对客户/用户意愿": customer,
+                "协作方式": team_style,
+                "学习新工具速度": learning_speed,
+                "偏好公司类型": company_type,
+                "感兴趣行业": industry,
+                "最看重因素": salary_priority,
+                "城市选择": city_preference,
+                "销售性质接受度": sales_acceptance,
+                "运营兴趣": operations_interest,
+                "开发岗兴趣": dev_interest,
+                "长期发展方向": long_term_goal,
+                "证书或优势关键词": certificates,
+            }
+            try:
+                with st.spinner("正在把问卷答案交给 AI 生成岗位方向建议..."):
+                    prompt = build_role_questionnaire_prompt(
+                        questionnaire_answers,
+                        st.session_state.parsed_resume_text,
+                    )
+                    st.session_state.role_questionnaire_result = call_agent(prompt)
+                    st.session_state.role_recommendations = []
+                st.success("岗位方向建议已生成。")
+            except LLMConfigError as exc:
+                st.error(str(exc))
+                st.info("问卷推荐需要使用你在左侧填写的 API 配置。")
+            except Exception as exc:
+                st.error("生成岗位方向建议失败，请检查 API 地址、模型名称、Key、额度或网络状态。")
+                st.code(str(exc))
 
-        if st.session_state.role_recommendations:
-            st.markdown("**推荐方向**")
-            for item in st.session_state.role_recommendations:
-                st.write(f"{item['role']}｜推荐分：{item['score']}｜{item['reason']}")
+        if st.session_state.role_questionnaire_result:
+            st.markdown("**AI 岗位方向建议**")
+            st.markdown(st.session_state.role_questionnaire_result)
 
     col_left, col_right = st.columns(2)
 
@@ -974,16 +1105,33 @@ def main() -> None:
     col_role, col_city = st.columns([2, 1])
 
     with col_role:
-        target_role = st.selectbox(
+        selected_target_role = st.selectbox(
             "目标岗位方向",
             TARGET_ROLE_OPTIONS,
         )
+        if selected_target_role == "其他":
+            custom_target_role = st.text_input(
+                "输入你的求职方向",
+                placeholder="例如：项目助理、短视频运营、AI 产品助理",
+                key="custom_target_role",
+            )
+            target_role = custom_target_role.strip()
+        else:
+            target_role = selected_target_role
 
     with col_city:
         city = st.text_input("目标城市", value="杭州", help="用于生成招聘搜索关键词和推荐链接。")
 
-    if target_role == "其他":
-        target_role = st.text_input("请填写目标岗位方向", placeholder="例如：项目助理")
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        render_metric_card("当前岗位方向", target_role or "未填写", "来自当前目标岗位选择")
+    with summary_cols[1]:
+        render_metric_card("岗位侦察", str(len(st.session_state.crawled_jobs)), "抓取真实岗位详情页")
+    with summary_cols[2]:
+        render_metric_card("历史记录", str(len(st.session_state.usage_history)), "可载入旧结果继续编辑")
+    with summary_cols[3]:
+        export_state = "已生成" if (st.session_state.resume_docx_data or st.session_state.resume_pdf_data) else "Word / PDF"
+        render_metric_card("导出能力", export_state, "支持模板参考与在线编辑")
 
     st.caption("岗位侦察会抓取公开网页和搜索结果，不绕过登录、验证码或付费限制；岗位是否仍在招聘以原网页为准。")
 
@@ -1067,18 +1215,21 @@ def main() -> None:
             st.session_state.editable_resume_text = ""
             st.session_state.word_resume_text = ""
             st.session_state.pdf_resume_text = ""
+            set_agent_step(1)
             clear_resume_exports()
             with st.status("Agent 正在执行求职分析流程...", expanded=True) as status:
                 st.write("步骤 1/6：读取简历内容")
                 progress.progress(10)
                 try:
                     st.write("步骤 2/6：生成搜索关键词和热门能力标签")
+                    set_agent_step(2)
                     st.session_state.search_keywords = build_search_keywords(target_role, city)
                     st.session_state.job_links = build_job_links(target_role, city)
                     st.session_state.hot_skills = recommend_hot_skills(target_role, resume_text)
                     progress.progress(25)
 
                     st.write("步骤 3/6：爬取公开招聘信息并抽取岗位卡片")
+                    set_agent_step(3)
                     if crawl_enabled:
                         st.session_state.crawled_jobs = crawl_jobs(
                             target_role=target_role,
@@ -1093,6 +1244,7 @@ def main() -> None:
                     progress.progress(45)
 
                     st.write("步骤 4/6：调用大模型分析 JD、岗位要求和简历匹配度")
+                    set_agent_step(4)
                     prompt = build_user_prompt(
                         resume_text=resume_text,
                         jd_text=jd_text,
@@ -1102,6 +1254,7 @@ def main() -> None:
                     progress.progress(70)
 
                     st.write("步骤 5/6：记录岗位画像，等待用户手动生成简历优化稿")
+                    set_agent_step(5)
                     st.write("为节省 API token，本次不自动改写简历。需要时请在下方点击“生成简历优化稿”。")
                     progress.progress(90)
 
@@ -1218,6 +1371,162 @@ def main() -> None:
 
     st.divider()
 
+    render_section("旧模板简历替换工具", "读取 DOCX 底层文字节点，只替换文字，不改模板格式、文本框、线条、颜色、图片和位置。")
+    try:
+        fixed_template_bytes = st.session_state.fixed_template_bytes or load_template_bytes()
+        fixed_blocks = extract_template_blocks(fixed_template_bytes)
+    except FixedTemplateError as exc:
+        fixed_template_bytes = b""
+        fixed_blocks = []
+        st.error(str(exc))
+
+    fixed_left, fixed_right = st.columns([1.05, 0.95], gap="large")
+    with fixed_left:
+        st.markdown("**使用上方简历内容**")
+        fixed_resume_source = resume_text.strip()
+        if fixed_resume_source:
+            st.success("已读取上方“简历内容”，无需在此重复上传。")
+        else:
+            st.warning("上方“简历内容”为空，请先上传或粘贴简历。")
+        st.text_area(
+            "当前用于旧模板替换的简历内容",
+            value=fixed_resume_source,
+            height=320,
+            disabled=True,
+        )
+
+    with fixed_right:
+        st.markdown("**模板导入与状态**")
+        fixed_template_upload = st.file_uploader(
+            "上传自己的 DOCX 模板",
+            type=["docx"],
+            key="fixed_template_uploader",
+            help="只支持 DOCX。页面不会显示模板原文。",
+        )
+        if fixed_template_upload is not None:
+            current_signature = file_signature(fixed_template_upload)
+            if current_signature != st.session_state.fixed_template_signature:
+                st.session_state.fixed_template_bytes = fixed_template_upload.getvalue()
+                st.session_state.fixed_template_name = fixed_template_upload.name
+                st.session_state.fixed_template_signature = current_signature
+                st.session_state.fixed_replacements_text = ""
+                st.session_state.fixed_result_docx = b""
+                set_agent_step(1)
+                st.success("自定义模板已加载")
+            fixed_template_bytes = st.session_state.fixed_template_bytes or load_template_bytes()
+            fixed_blocks = extract_template_blocks(fixed_template_bytes)
+        st.markdown(
+            """
+            <div class="risk-card">
+              <strong>模板已加载</strong><br>
+              <span style="color:#6B7280;font-size:12px;line-height:1.7;">
+              页面不会显示模板中的任何原始文字。生成时只在后台读取文字节点，用于等长替换和保持版式。
+              </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.session_state.fixed_template_name:
+            st.caption("当前使用自定义 DOCX 模板")
+        else:
+            st.caption("当前使用项目默认模板")
+        st.metric("可替换文字块", len(fixed_blocks))
+        st.caption("每段新文字会按原文字长度截断，尽量保持一页。")
+        action_left, action_right = st.columns(2)
+        with action_left:
+            if st.button("恢复默认模板", use_container_width=True):
+                st.session_state.fixed_template_bytes = b""
+                st.session_state.fixed_template_name = ""
+                st.session_state.fixed_template_signature = ""
+                st.session_state.fixed_replacements_text = ""
+                st.session_state.fixed_result_docx = b""
+                set_agent_step(1)
+                st.rerun()
+        with action_right:
+            if st.button("清空结果", use_container_width=True):
+                st.session_state.fixed_replacements_text = ""
+                st.session_state.fixed_result_docx = b""
+                set_agent_step(1)
+                st.rerun()
+
+    fixed_role_col, fixed_city_col = st.columns(2)
+    with fixed_role_col:
+        fixed_target_role = st.text_input("旧模板目标岗位", value=target_role or "未指定")
+    with fixed_city_col:
+        fixed_city = st.text_input("旧模板目标城市", value=city or "未指定")
+
+    if st.button("生成替换文字", type="primary", use_container_width=True):
+        set_agent_step(5)
+        if not fixed_resume_source.strip():
+            st.error("请先在页面上方上传或粘贴原始简历。")
+        elif not fixed_template_bytes or not fixed_blocks:
+            st.error("模板不可用或没有识别到可替换文字块。")
+        else:
+            try:
+                with st.status("正在生成等长替换文字...", expanded=True) as status:
+                    st.write("读取模板文字块")
+                    st.write("调用 AI 生成替换 JSON")
+                    prompt = build_replacement_prompt(
+                        fixed_resume_source,
+                        fixed_target_role,
+                        fixed_city,
+                        fixed_blocks,
+                    )
+                    raw_replacements = call_agent(prompt)
+                    replacements = normalize_replacements(raw_replacements, fixed_blocks)
+                    st.session_state.fixed_replacements_text = json.dumps(
+                        to_editable_replacements(replacements),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    st.session_state.fixed_result_docx = b""
+                    set_agent_step(5)
+                    status.update(label="替换文字已生成", state="complete", expanded=False)
+            except (LLMConfigError, FixedTemplateError) as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error("生成失败，请检查 API Key、模型或网络。")
+                st.code(str(exc))
+
+    if st.session_state.fixed_replacements_text:
+        st.markdown("**检查和编辑替换 JSON**")
+        st.caption("页面只显示 `index/new_text/max_chars`，不会显示模板原文字。可以手动修改 `new_text`，建议不要超过 `max_chars`。")
+        st.text_area("替换 JSON", key="fixed_replacements_text", height=360)
+        render_col, download_col = st.columns(2)
+        with render_col:
+            if st.button("生成 Word", use_container_width=True):
+                try:
+                    editable_replacements = json.loads(st.session_state.fixed_replacements_text)
+                    replacements = merge_editable_replacements(editable_replacements, fixed_blocks)
+                    result = render_fixed_template(replacements, fixed_template_bytes)
+                    st.session_state.fixed_result_docx = result
+                    set_agent_step(6)
+                    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    path = save_output_file(f"{stamp}_fixed_template_resume.docx", result)
+                    st.success(f"Word 已生成：{path}")
+                except json.JSONDecodeError as exc:
+                    st.error(f"替换 JSON 格式错误：{exc}")
+                except Exception as exc:
+                    st.error("生成 Word 失败。")
+                    st.code(str(exc))
+        with download_col:
+            if st.session_state.fixed_result_docx:
+                st.success("Word 文件已准备好，可以下载。")
+            else:
+                st.info("生成 Word 后下载按钮会变为可用。")
+            st.download_button(
+                "下载 Word",
+                data=st.session_state.fixed_result_docx,
+                file_name="旧模板替换生成简历.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                disabled=not bool(st.session_state.fixed_result_docx),
+                use_container_width=True,
+            )
+    else:
+        st.info("上传或粘贴简历后，点击“生成替换文字”。")
+
+    st.divider()
+
     render_section("简历优化稿", "先手动调用 AI 生成简历正文，再预览、编辑并按需导出 Word / PDF。")
     st.caption("为节省 API token，开始分析不会自动生成简历优化稿。这里需要手动点击一次，后续 Word/PDF 导出只做本地文件生成。")
     generate_resume = st.button(
@@ -1240,6 +1549,7 @@ def main() -> None:
                 crawled_jobs=st.session_state.crawled_jobs,
                 hot_skills=st.session_state.hot_skills or recommend_hot_skills(target_role, resume_text),
             )
+            set_agent_step(5)
             st.session_state.resume_rewrite_result = call_agent(rewrite_prompt)
             st.session_state.editable_resume_text = extract_resume_document(st.session_state.resume_rewrite_result)
             clear_resume_exports()
@@ -1346,6 +1656,7 @@ def main() -> None:
                             )
                         st.session_state.resume_pdf_data = b""
                         st.session_state.template_pdf_data = b""
+                        set_agent_step(6)
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     main_docx = st.session_state.template_docx_data or st.session_state.resume_docx_data
                     file_path = save_history_file(f"{stamp}_word_resume.docx", main_docx)
@@ -1389,6 +1700,7 @@ def main() -> None:
                         st.session_state.resume_docx_data = b""
                         st.session_state.template_docx_data = b""
                         st.session_state.template_pdf_data = b""
+                        set_agent_step(6)
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     file_path = save_history_file(f"{stamp}_pdf_resume.pdf", st.session_state.resume_pdf_data)
                     append_usage_history(
@@ -1428,6 +1740,7 @@ def main() -> None:
                             title=f"{target_role}AI优化稿",
                             template_name=resume_template,
                         )
+                    set_agent_step(6)
                     st.success("Word 文件已按当前编辑内容刷新。")
             with download_word:
                 word_data = st.session_state.template_docx_data or st.session_state.resume_docx_data
@@ -1455,6 +1768,7 @@ def main() -> None:
                         title=f"{target_role}优化版简历",
                         template_name=resume_template,
                     )
+                    set_agent_step(6)
                     st.success("PDF 文件已按当前编辑内容刷新。")
             if st.session_state.resume_pdf_data:
                 render_pdf_preview(st.session_state.resume_pdf_data)
@@ -1505,6 +1819,7 @@ def main() -> None:
         use_container_width=True,
         disabled=not bool(st.session_state.analysis_result),
     )
+    workflow_placeholder.markdown(build_workflow_html(get_agent_step()), unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
