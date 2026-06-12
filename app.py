@@ -23,7 +23,45 @@ from hot_skills import recommend_hot_skills
 from job_crawler import crawl_jobs
 from job_links import build_job_links, build_search_keywords
 from llm_client import LLMConfigError, call_job_agent
-from prompts import build_resume_rewrite_prompt, build_role_questionnaire_prompt, build_template_resume_prompt, build_user_prompt
+from prompts import build_resume_rewrite_prompt, build_template_resume_prompt, build_user_prompt
+try:
+    from prompts import build_role_questionnaire_prompt
+except ImportError:
+    def build_role_questionnaire_prompt(answers: dict[str, str], resume_text: str = "") -> str:
+        answers_text = "\n".join(f"- {key}：{value}" for key, value in answers.items() if str(value).strip())
+        resume_text = resume_text.strip() or "用户暂未提供简历正文，请主要根据问卷答案判断。"
+        return f"""请根据下面的求职方向问卷，为用户推荐适合投递的岗位方向。
+
+【用户简历/背景补充】
+{resume_text}
+
+【问卷答案】
+{answers_text}
+
+严格要求：
+1. 输出 Markdown。
+2. 不要编造用户没有提供的经历、证书、项目或技能。
+3. 不要输出“如果你愿意”“我可以继续帮你”等后续服务邀约。
+4. 必须保留下面 8 个二级标题。
+
+## 一、综合求职画像
+
+## 二、最推荐的 3 个岗位方向
+
+每个岗位包含：岗位方向、推荐指数、为什么适合、需要补强、招聘搜索关键词、投递谨慎点。
+
+## 三、可以尝试的 3 个备选方向
+
+## 四、不建议优先投递的方向
+
+## 五、目标岗位选择建议
+
+## 六、简历补强优先级
+
+## 七、招聘网站搜索词
+
+## 八、7 天行动计划
+"""
 from resume_exporter import (
     build_docx,
     build_docx_from_template,
